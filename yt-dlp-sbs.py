@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SBS On Demand series/season downloader for Linux (version 3.0).
+"""SBS On Demand series/season downloader for Linux (version 3.1).
 
 Automatically checks yt-dlp, FFmpeg, curl, and the SBS extractor plugin.
 System package installation requires confirmation unless --yes is given.
@@ -22,6 +22,8 @@ from urllib.parse import urlparse
 
 PLUGIN_URL = ("https://raw.githubusercontent.com/phil2803/yt-dlp-sbsfix/main/"
               "yt-dlp-plugins/sbsfix/yt_dlp_plugins/extractor/sbsfix.py")
+CREDENTIALS_PATH = Path.home() / ".config" / "yt-dlp-sbs" / "credentials"
+SBS_TEST_URL = "https://www.sbs.com.au/ondemand/watch/2492268099663"
 PLUGIN_RELATIVE = Path(".config/yt-dlp/plugins/sbsfix/yt_dlp_plugins/extractor/sbsfix.py")
 SHOW_PATH = re.compile(r'^/ondemand/tv-series/([a-z0-9-]+)(?:/season-(\d+))?/?$')
 EPISODE_PATH = re.compile(
@@ -42,9 +44,11 @@ def execute(command, *, capture=False):
 def plugin_active():
     if not shutil.which('yt-dlp'):
         return False
-    proc = execute(['yt-dlp', '-v', '--list-extractors'], capture=True)
+    # --list-extractors exits before printing loaded plugin details on some builds.
+    # Simulate extraction instead; authentication failures do not mean plugin failure.
+    proc = execute(['yt-dlp', '-v', '--simulate', SBS_TEST_URL], capture=True)
     output = (proc.stdout or '') + (proc.stderr or '')
-    return proc.returncode == 0 and 'Extractor Plugins: sbsfix (SBSIE)' in output
+    return 'Extractor Plugins: sbsfix (SBSIE)' in output and '[SBS+sbsfix]' in output
 
 
 def package_command(missing):
@@ -69,7 +73,7 @@ def permission(question, yes):
 def install_plugin():
     target = Path.home() / PLUGIN_RELATIVE
     print(f'Downloading SBS plugin from {PLUGIN_URL}', flush=True)
-    request = urllib.request.Request(PLUGIN_URL, headers={'User-Agent': 'yt-dlp-sbs/3.0'})
+    request = urllib.request.Request(PLUGIN_URL, headers={'User-Agent': 'yt-dlp-sbs/3.1'})
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             content = response.read(256 * 1024 + 1)
@@ -217,16 +221,65 @@ def valid_download(path):
         raise RuntimeError('Video failed FFprobe duration check')
 
 
-def make_netrc(folder, username, password):
+def netrc_line(username, password):
     def quote(value):
         return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
-    if '\n' in username + password or '\r' in username + password:
-        raise RuntimeError('Credentials must not contain newlines')
-    path = folder / 'account.netrc'
-    descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    with os.fdopen(descriptor, 'w') as out:
-        out.write(f'machine sbs login {quote(username)} password {quote(password)}\n')
-    return path
+    if any(ch in username + password for ch in ('\n', '\r', '\x00')):
+        raise RuntimeError('Credentials contain invalid control characters')
+    return f'machine sbs login {quote(username)} password {quote(password)}\n'
+
+
+def write_credentials(path, username, password):
+    """Write credentials atomically, restricted to the current user."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.parent.is_symlink():
+        raise RuntimeError('Credential directory cannot be a symlink')
+    os.chmod(path.parent, 0o700)
+    if path.is_symlink():
+        raise RuntimeError('Credential file cannot be a symlink')
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix='.credentials-',
+                                         delete=False) as handle:
+            temp_path = Path(handle.name)
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(netrc_line(username, password).encode('utf-8'))
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def stored_credentials_valid(path):
+    if not path.is_file() or path.is_symlink():
+        return False
+    mode = path.stat().st_mode & 0o777
+    if mode != 0o600:
+        raise RuntimeError(f'Credential file has unsafe permissions ({mode:04o}): {path}')
+    return True
+
+
+def choose_credentials(args, temporary_dir):
+    """Return a .netrc path, with no credentials passed via command arguments."""
+    if not args.no_saved_credentials and stored_credentials_valid(CREDENTIALS_PATH):
+        print(f'Using saved SBS credentials: {CREDENTIALS_PATH}')
+        return CREDENTIALS_PATH
+    username = args.email or input('SBS account email: ').strip()
+    if not username:
+        raise RuntimeError('No SBS account email supplied')
+    password = getpass.getpass('SBS password: ')
+    if not password:
+        raise RuntimeError('No SBS password supplied')
+    if not args.no_saved_credentials and permission('Save credentials for future downloads?', False):
+        write_credentials(CREDENTIALS_PATH, username, password)
+        print(f'Credentials saved to {CREDENTIALS_PATH} (mode 0600)')
+        return CREDENTIALS_PATH
+    temporary_path = temporary_dir / 'account.netrc'
+    # TemporaryDirectory is private to the user and is removed after the run.
+    fd = os.open(temporary_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, 'w') as stream:
+        stream.write(netrc_line(username, password))
+    return temporary_path
 
 
 def download_one(root, title, season, episode, video_id, netrc, replace):
@@ -289,10 +342,21 @@ def main():
     parser.add_argument('--download', action='store_true', help='Download episodes (default: preview)')
     parser.add_argument('--replace', action='store_true',
                         help='Replace existing episode videos after a successful download')
-    parser.add_argument('--email', help='SBS login email; otherwise prompt on download')
+    parser.add_argument('--email', help='SBS login email if not using saved credentials')
+    parser.add_argument('--no-saved-credentials', action='store_true',
+                        help='Ignore saved credentials and prompt again (do not save)')
+    parser.add_argument('--forget-credentials', action='store_true',
+                        help='Delete saved credentials and exit')
     args = parser.parse_args()
+    if args.forget_credentials:
+        if CREDENTIALS_PATH.is_symlink():
+            print('ERROR: Credential path is a symlink; refusing to delete', file=sys.stderr)
+            return 1
+        CREDENTIALS_PATH.unlink(missing_ok=True)
+        print(f'Removed saved SBS credentials: {CREDENTIALS_PATH}')
+        return 0
     if not args.url and not args.setup_only:
-        parser.error('Supply an SBS show/season URL or use --setup-only')
+        parser.error('Supply an SBS show/season URL, --setup-only, or --forget-credentials')
     try:
         setup_dependencies(yes=args.yes, no_install=args.no_install)
     except (RuntimeError, OSError) as exc:
@@ -338,19 +402,15 @@ def main():
         return 1 if failed_seasons else 0
     if not todo:
         return 1 if failed_seasons else 0
-    email = args.email or input('SBS account email: ').strip()
-    if not email:
-        print('ERROR: No SBS account email', file=sys.stderr)
-        return 1
-    password = getpass.getpass('SBS password: ')
-    if not password:
-        print('ERROR: No SBS password', file=sys.stderr)
-        return 1
     root.mkdir(parents=True, exist_ok=True)
     errors = 0
-    with tempfile.TemporaryDirectory(prefix='.sbs-auth-', dir=root) as work:
-        secret_path = make_netrc(Path(work), email, password)
-        del password
+    # Do not put authentication files on the media volume.
+    with tempfile.TemporaryDirectory(prefix='.sbs-auth-') as work:
+        try:
+            secret_path = choose_credentials(args, Path(work))
+        except (RuntimeError, OSError, EOFError) as exc:
+            print(f'ERROR: {exc}', file=sys.stderr)
+            return 1
         for season, episode, ident in todo:
             code = f'S{season:02d}E{episode:02d}'
             try:
