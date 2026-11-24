@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""SBS On Demand series/season downloader for Linux (version 3.1).
+"""SBS On Demand series/season downloader for Linux (version 3.2).
 
 Automatically checks yt-dlp, FFmpeg, curl, and the SBS extractor plugin.
 System package installation requires confirmation unless --yes is given.
-Default action is preview; add --download to save episodes.
+Default action is download; add --preview to inspect episodes without saving.
 """
 import argparse
 import ast
@@ -73,7 +73,7 @@ def permission(question, yes):
 def install_plugin():
     target = Path.home() / PLUGIN_RELATIVE
     print(f'Downloading SBS plugin from {PLUGIN_URL}', flush=True)
-    request = urllib.request.Request(PLUGIN_URL, headers={'User-Agent': 'yt-dlp-sbs/3.1'})
+    request = urllib.request.Request(PLUGIN_URL, headers={'User-Agent': 'yt-dlp-sbs/3.2'})
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             content = response.read(256 * 1024 + 1)
@@ -337,9 +337,15 @@ def main():
     parser.add_argument('--setup-only', action='store_true', help='Check/install dependencies then exit')
     parser.add_argument('--yes', action='store_true', help='Approve installing missing dependencies and SBS plugin')
     parser.add_argument('--no-install', action='store_true', help='Do not install packages or plugin')
-    parser.add_argument('--output-dir', type=Path, default=Path('.'),
-                        help='Parent output folder (default: current directory)')
-    parser.add_argument('--download', action='store_true', help='Download episodes (default: preview)')
+    parser.add_argument('output_directory', nargs='?', type=Path,
+                        help='Parent output directory after URL (default: current directory)')
+    parser.add_argument('--output-dir', type=Path, default=None,
+                        help='Alternative way to set the parent output directory')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--preview', action='store_true',
+                      help='List episodes without downloading (default: download)')
+    mode.add_argument('--download', action='store_true',
+                      help='Download episodes (legacy option; downloads are now the default)')
     parser.add_argument('--replace', action='store_true',
                         help='Replace existing episode videos after a successful download')
     parser.add_argument('--email', help='SBS login email if not using saved credentials')
@@ -373,7 +379,10 @@ def main():
     if requested_season == 0:
         parser.error('Season must be greater than zero')
     show_title = show_name_from_slug(slug)
-    root = args.output_dir.expanduser().resolve() / show_title
+    if args.output_directory is not None and args.output_dir is not None:
+        parser.error('Specify the output directory either after the URL or with --output-dir, not both')
+    parent_dir = args.output_directory or args.output_dir or Path.cwd()
+    root = parent_dir.expanduser().resolve() / show_title
     try:
         document = get_page(args.url)
         episodes, failed_seasons = discover(slug, requested_season, document)
@@ -395,10 +404,10 @@ def main():
                   + (f' ({len(old)} existing)' if old else ''))
             todo.append((season, episode, ident))
     print(f'Found {len(valid)} unique episodes; {len(conflicts)} conflicts; '
-          f'{len(todo)} to {"download" if args.download else "process"}.')
+          f'{len(todo)} to {"preview" if args.preview else "download"}.')
     print(f'Output: {root}')
-    if not args.download:
-        print('PREVIEW ONLY. Add --download to save files. Add --replace to replace existing videos.')
+    if args.preview:
+        print('PREVIEW ONLY. No files changed. Omit --preview to download.')
         return 1 if failed_seasons else 0
     if not todo:
         return 1 if failed_seasons else 0
